@@ -1,7 +1,7 @@
   // ==UserScript==
   // @name         Perplexity Model Selector Redesign v2
   // @namespace    https://perplexity.ai/
-// @version      2.4.18
+  // @version      2.6.2
   // @description  Non-thinking/Thinking model picker for Perplexity, plus one-shot /rest/models/config change watch on page load.
   // @author       you
   // @match        https://www.perplexity.ai/*
@@ -19,6 +19,7 @@
     window.__pplxModelUIv2Installed = true;
   
     const LS_HIDDEN = "pmu_hidden_models";
+    const LS_LAST_SEL = "pmu_last_selection";
     const TM_CONFIG_HASH = "pmu_models_config_hash";
     const TM_CONFIG_JSON = "pmu_models_config_last";
     const TM_CONFIG_PREV = "pmu_models_config_prev";
@@ -31,18 +32,22 @@
       menu: null,
       lastModels: null, // unlocked models from last showPanel (for early pointerdown pick)
       lastAllModels: null, // full model list for Edit view
+      lastSelection: null, // { name, thinking } — trigger no longer encodes this on current PPLX
       busy: false, // selecting / driving native menu
       picking: false, // pointer is down on our panel — don't tear it down when Radix closes
+      holdMenu: false, // keep native menu mounted through select→thinking
       pickTimer: null,
       editMode: false,
       ignoreSelectUntil: 0,
       suppressPanelUntil: 0,
       menuLock: null,
       panelMode: null, // "model" | "rewrite" — which flavor state.panel currently shows
-    rewriteTrigger: null, // the Rewrite button that owns the currently-open rewrite menu
-    rewriteMenu: null, // the live native Rewrite menu being custom-styled
+      rewriteTrigger: null, // the Rewrite button that owns the currently-open rewrite menu
+      rewriteMenu: null, // the live native Rewrite menu being custom-styled
       pendingRewriteTrigger: null, // Rewrite button just pressed, awaiting its menu to mount
       pendingRewriteAt: 0,
+      pickHandled: false,
+      chipFreeze: null, // { trigger, overlay }
     };
   
     // —— persistence ————————————————————————————————————————————————
@@ -57,6 +62,32 @@
     function saveHidden(set) {
       localStorage.setItem(LS_HIDDEN, JSON.stringify([...set]));
     }
+
+    function loadLastSelection() {
+      try {
+        const v = JSON.parse(localStorage.getItem(LS_LAST_SEL) || "null");
+        if (v && typeof v.name === "string" && v.name) {
+          return { name: v.name, thinking: !!v.thinking };
+        }
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+
+    function saveLastSelection(name, thinking) {
+      if (!name) return;
+      const sel = { name, thinking: !!thinking };
+      state.lastSelection = sel;
+      try {
+        localStorage.setItem(LS_LAST_SEL, JSON.stringify(sel));
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Seed from prior session so the first panel open can highlight correctly.
+    state.lastSelection = loadLastSelection();
   
     // —— model classification ————————————————————————————————————————
   
@@ -94,13 +125,50 @@
       const style = document.createElement("style");
       style.id = STYLE_ID;
       style.textContent = `
-        /* Hide native menus while our panel is up, or while we expect/drive one. */
+        /* Hide native menus while our panel is up, or while we expect/drive one.
+           During pmu-drive we still hide them visually but keep pointer-events so
+           our synthetic activations can land on Radix items. */
         [data-pmu-hidden="1"],
         body.pmu-expect [role="menu"][data-state="open"],
         body.pmu-busy [role="menu"] {
           opacity: 0 !important;
           visibility: hidden !important;
+        }
+        body.pmu-busy:not(.pmu-drive) [role="menu"],
+        body.pmu-expect:not(.pmu-drive) [role="menu"][data-state="open"],
+        [data-pmu-hidden="1"] {
           pointer-events: none !important;
+        }
+        body.pmu-drive [role="menu"] {
+          pointer-events: auto !important;
+        }
+
+        /* Cover the composer chip during drive. Overlay is the only visible
+           label — never rewrite React text nodes (that caused doubled labels). */
+        button.pmu-chip-frozen {
+          position: relative !important;
+        }
+        button.pmu-chip-frozen > .pmu-chip-overlay {
+          position: absolute !important;
+          inset: 0 !important;
+          display: flex !important;
+          align-items: center !important;
+          justify-content: flex-start !important;
+          padding-left: 0.75rem !important;
+          padding-right: 1.35rem !important;
+          pointer-events: none !important;
+          white-space: nowrap !important;
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          font: inherit !important;
+          color: inherit !important;
+          background: inherit !important;
+          border-radius: inherit !important;
+          z-index: 2 !important;
+        }
+        button.pmu-chip-frozen > :not(.pmu-chip-overlay) {
+          visibility: hidden !important;
+          opacity: 0 !important;
         }
   
         .pmu-panel {
@@ -248,7 +316,177 @@
     // —— tiny utils ——————————————————————————————————————————————————
   
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  
+
+    /** Poll until pred() is truthy. Faster than fixed sleeps for DOM-driven work. */
+    async function waitFor(pred, { timeout = 800, interval = 8 } = {}) {
+      if (pred()) return pred();
+      const start = performance.now();
+      while (performance.now() - start < timeout) {
+        await wait(interval);
+        const v = pred();
+        if (v) return v;
+      }
+      return pred() || null;
+    }
+
+    /** Parse a composer chip / aria-label into { name, thinking }. */
+    function parseSelectionLabel(raw) {
+      const text = (raw || "").replace(/\s+/g, " ").trim();
+      if (!text || /^model$/i.test(text)) return null;
+      const thinking = /\sThinking$/i.test(text);
+      let name = text.replace(/\sThinking$/i, "").trim();
+      // Collapse leftover "Name Name" from older label-lock fights with React.
+      const dup = name.match(/^(.+?)\s+\1$/i);
+      if (dup) name = dup[1].trim();
+      if (!name || /^model$/i.test(name)) return null;
+      return { name, thinking };
+    }
+
+    function desiredTriggerLabel(name, thinking) {
+      return thinking ? `${name} Thinking` : name;
+    }
+
+    /**
+     * Cover the composer chip with an overlay showing the final label.
+     * Hides React's intermediate text. NEVER rewrite React text nodes —
+     * that races the framework and produces "Name Name Thinking".
+     */
+    function freezeChip(name, thinking) {
+      unfreezeChip();
+      const trigger = getTrigger();
+      if (!trigger || !name) return;
+      const label = desiredTriggerLabel(name, thinking);
+      const overlay = document.createElement("span");
+      overlay.className = "pmu-chip-overlay";
+      overlay.textContent = label;
+      trigger.classList.add("pmu-chip-frozen");
+      trigger.appendChild(overlay);
+      state.chipFreeze = { trigger, overlay, label, name, thinking };
+    }
+
+    /**
+     * Drop the overlay once the native chip has a non-doubled label.
+     * Never rewrite React text to force a label — only collapse the exact
+     * "Name Name" residue older builds left behind.
+     */
+    function unfreezeChip() {
+      const fr = state.chipFreeze;
+      if (!fr) return;
+      const { trigger, overlay, name, thinking } = fr;
+
+      const nativeText = () => {
+        if (!trigger) return "";
+        // Exclude our overlay so we only see React's real chip text.
+        let out = "";
+        const walk = (node) => {
+          if (node === overlay) return;
+          if (node.nodeType === 3) {
+            out += node.nodeValue || "";
+            return;
+          }
+          if (node.nodeType !== 1) return;
+          if (node.classList && node.classList.contains("pmu-chip-overlay")) return;
+          for (const child of node.childNodes) walk(child);
+        };
+        walk(trigger);
+        return out.replace(/\s+/g, " ").trim();
+      };
+
+      const finish = () => {
+        if (state.chipFreeze !== fr) return;
+        state.chipFreeze = null;
+        try {
+          if (overlay && overlay.parentNode) overlay.remove();
+        } catch {
+          /* ignore */
+        }
+        if (trigger) {
+          trigger.classList.remove("pmu-chip-frozen");
+          repairDoubledChipLabel(trigger);
+        }
+        if (name) saveLastSelection(name, thinking);
+      };
+
+      // Hold the overlay through PPLX's chip crossfade so intermediate dual
+      // labels never show. Only inspect native text (overlay excluded).
+      const start = performance.now();
+      const tick = () => {
+        if (state.chipFreeze !== fr) return;
+        if (trigger && document.contains(trigger)) {
+          repairDoubledChipLabel(trigger);
+          const live = parseSelectionLabel(nativeText());
+          const aria = parseSelectionLabel(trigger.getAttribute("aria-label") || "");
+          const ok =
+            (live && live.name === name && !!live.thinking === !!thinking) ||
+            (aria && aria.name === name && !!aria.thinking === !!thinking);
+          if (performance.now() - start >= 360 && ok) {
+            finish();
+            return;
+          }
+        }
+        if (performance.now() - start >= 550) {
+          finish();
+          return;
+        }
+        setTimeout(tick, 40);
+      };
+      setTimeout(tick, 160);
+    }
+
+    /** Collapse "Name Name" / "Name Name Thinking" left by older builds / crossfade. */
+    function repairDoubledChipLabel(trigger) {
+      const root = trigger || getTrigger();
+      if (!root) return false;
+
+      // Leaf text nodes under the chip (skip our overlay).
+      const leaves = [];
+      const collect = (node) => {
+        if (!node) return;
+        if (node.nodeType === 3) {
+          if ((node.nodeValue || "").trim()) leaves.push(node);
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        if (node.classList && node.classList.contains("pmu-chip-overlay")) return;
+        for (const child of node.childNodes) collect(child);
+      };
+      collect(root);
+
+      let fixed = false;
+
+      // Per-node "Name Name" / "Name Name Thinking".
+      for (const node of leaves) {
+        const t = (node.nodeValue || "").replace(/\s+/g, " ").trim();
+        const m = t.match(/^(.+?)\s+\1(\s+Thinking)?$/i);
+        if (m) {
+          node.nodeValue = m[1] + (m[2] || "");
+          fixed = true;
+        }
+      }
+
+      // Crossfade case: two sibling leaves "Name" + "Name Thinking" (or "Name" + "Name").
+      if (leaves.length >= 2) {
+        for (let i = 0; i < leaves.length - 1; i++) {
+          const a = (leaves[i].nodeValue || "").replace(/\s+/g, " ").trim();
+          const b = (leaves[i + 1].nodeValue || "").replace(/\s+/g, " ").trim();
+          if (!a || !b) continue;
+          if (b === a || b === a + " Thinking" || new RegExp("^" + a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+Thinking$", "i").test(b)) {
+            // Keep the newer leaf (b), clear the fading one (a).
+            leaves[i].nodeValue = "";
+            fixed = true;
+          } else if (a === b || a === b + " Thinking") {
+            leaves[i + 1].nodeValue = "";
+            fixed = true;
+          }
+        }
+      }
+
+      return fixed;
+    }
+
+    function setDrive(on) {
+      document.body.classList.toggle("pmu-drive", on);
+    }
   
     function hasLockIcon(el) {
       return [...el.querySelectorAll("use")].some(
@@ -260,42 +498,80 @@
       return /apps and more/i.test((btn && btn.getAttribute("aria-label")) || "");
     }
   
-    // The per-message "Rewrite" control opens a menu with the exact same
-    // "Selects the best available model" markup as the main composer's model
-    // picker. Must not be treated as our trigger or our panel replaces the
-    // native rewrite-model menu and rewriting breaks.
+    // The per-message "Rewrite" control opens a menu with model rows similar
+    // to the main composer picker. Must not be treated as our trigger or our
+    // panel replaces the native rewrite-model menu and rewriting breaks.
     function isRewriteButton(btn) {
       if (!btn) return false;
-      const label = (btn.getAttribute("aria-label") || "") + " " + (btn.getAttribute("title") || "") + " " + (btn.textContent || "");
+      const label =
+        (btn.getAttribute("aria-label") || "") +
+        " " +
+        (btn.getAttribute("title") || "") +
+        " " +
+        (btn.textContent || "");
       return /rewrite/i.test(label.trim());
     }
-  
+
     function isLikelyModelTrigger(btn) {
       if (!btn || isAppsButton(btn) || isRewriteButton(btn)) return false;
-      const label = btn.getAttribute("aria-label") || "";
-      if (/\bThinking$/i.test(label) || /Best|Sonar|GPT|Gemini|Claude|Kimi|GLM|Grok|Nemotron/i.test(label)) {
+      const label = (btn.getAttribute("aria-label") || "").trim();
+      const text = (btn.textContent || "").replace(/\s+/g, " ").trim();
+      // Current PPLX uses a generic "Model" chip; older builds put the model name
+      // (and optional "Thinking") directly on aria-label.
+      if (/^model$/i.test(label) || /^model$/i.test(text)) return true;
+      if (
+        /\bThinking$/i.test(label) ||
+        /Best|Sonar|GPT|Gemini|Claude|Kimi|GLM|Grok|Nemotron|Terra/i.test(label)
+      ) {
         return true;
       }
       return /\brounded-full\b/.test(btn.className) && /\bpx-3\b/.test(btn.className);
     }
-  
+
+    /** Header / promo rows that used to say "Selects the best available model". */
+    function isAutoBestItem(el) {
+      const t = (el && el.textContent) || "";
+      return /Selects the best available model/i.test(t) || /Access the top AI models/i.test(t);
+    }
+
+    function menuModelNameCount(menu) {
+      if (!menu) return 0;
+      return menu.querySelectorAll('.col-start-2 span[translate="no"]').length;
+    }
+
     function isModelMenu(menu) {
-      return /Selects the best available model/.test(menu.textContent || "");
+      if (!menu) return false;
+      // Submenus (Thinking toggle / promo flyouts) sit on the side — never the root picker.
+      const side = menu.getAttribute("data-side");
+      if (side === "right" || side === "left") return false;
+      const text = menu.textContent || "";
+      // Prefer the known promo/header copy (old + new), then fall back to
+      // "enough named model rows" so we still match if copy changes again.
+      if (/Selects the best available model/i.test(text)) return true;
+      if (/Access the top AI models/i.test(text)) return true;
+      return menuModelNameCount(menu) >= 3;
     }
-  
+
     function getOpenModelMenu() {
-      return [...document.querySelectorAll('[role="menu"][data-state="open"]')].find(isModelMenu) || null;
+      return (
+        [...document.querySelectorAll('[role="menu"][data-state="open"]')].find(isModelMenu) || null
+      );
     }
-  
+
     function triggerFromMenu(menu) {
       const id = menu && menu.getAttribute("aria-labelledby");
       if (!id) return null;
       const t = document.getElementById(id);
       return t && !isAppsButton(t) && !isRewriteButton(t) ? t : null;
     }
-  
+
     function getTrigger() {
-      if (state.trigger && document.contains(state.trigger) && !isAppsButton(state.trigger)) {
+      if (
+        state.trigger &&
+        document.contains(state.trigger) &&
+        !isAppsButton(state.trigger) &&
+        !isRewriteButton(state.trigger)
+      ) {
         return state.trigger;
       }
       const fromMenu = triggerFromMenu(getOpenModelMenu());
@@ -303,24 +579,29 @@
         state.trigger = fromMenu;
         return fromMenu;
       }
-      const found = [...document.querySelectorAll('button[aria-haspopup="menu"]')].find(isLikelyModelTrigger);
+      const found = [...document.querySelectorAll('button[aria-haspopup="menu"]')].find(
+        isLikelyModelTrigger
+      );
       if (found) state.trigger = found;
       return found || null;
     }
-  
+
     /** Model rows have a dedicated name span; non-model rows (Search, Deep
      *  research, the auto "Best"/"Rewrite" entry, …) don't — fall back to their
-     *  own text, stripped of the shared "Selects the best available model" hint. */
+     *  own text, stripped of promo headers. */
     function itemName(el) {
       const nameEl = el.querySelector('.col-start-2 span[translate="no"]');
       if (nameEl) return nameEl.textContent.trim();
-      return (el.textContent || "").replace(/Selects the best available model.*$/i, "").trim();
+      return (el.textContent || "")
+        .replace(/Selects the best available model.*$/i, "")
+        .replace(/Access the top AI models.*$/i, "")
+        .trim();
     }
-  
+
     function findModelItem(menu, name) {
       return [...menu.querySelectorAll('[role^="menuitem"]')].find((it) => itemName(it) === name);
     }
-  
+
     function extractItem(el) {
       const name = itemName(el);
       const svg = el.querySelector("svg");
@@ -339,23 +620,49 @@
         isModelRow: !!el.querySelector('.col-start-2 span[translate="no"]'),
       };
     }
-  
-    function getSelection() {
+
+    /**
+     * Selection from the live composer chip only (no remembered override).
+     * Used to decide whether a native menu drive is still needed.
+     */
+    function readTriggerSelection() {
       const trigger = getTrigger();
-      const label = (trigger && trigger.getAttribute("aria-label")) || "";
-      const thinking = /\sThinking$/i.test(label);
-      return { name: label.replace(/\sThinking$/i, "").trim(), thinking };
+      if (!trigger) return { name: "", thinking: false };
+      const fromAria = parseSelectionLabel(trigger.getAttribute("aria-label") || "");
+      if (fromAria) return fromAria;
+      const fromText = parseSelectionLabel(trigger.textContent || "");
+      if (fromText) return fromText;
+      return { name: "", thinking: false };
+    }
+
+    /**
+     * Current selection for UI. Prefer our last confirmed pick when the chip is
+     * a generic "Model" label; otherwise trust the live chip.
+     * Never rewrite the native chip DOM — that races React and doubles labels.
+     */
+    function readNativeSelection() {
+      const fromTrigger = readTriggerSelection();
+      if (fromTrigger.name) return fromTrigger;
+      if (state.lastSelection && state.lastSelection.name) {
+        return { name: state.lastSelection.name, thinking: !!state.lastSelection.thinking };
+      }
+      return { name: "", thinking: false };
+    }
+
+    function getSelection() {
+      return readNativeSelection();
     }
   
     function setBusy(on) {
       state.busy = on;
       document.body.classList.toggle("pmu-busy", on);
+      if (!on) setDrive(false);
     }
-  
+
     function setExpect(on) {
       document.body.classList.toggle("pmu-expect", on);
     }
-  
+
     function markPicking() {
       state.picking = true;
       clearTimeout(state.pickTimer);
@@ -397,12 +704,13 @@
               };
             }
           }
-          // Block controlled close while our panel is up (outside click / focus steal).
+          // Block controlled close while our panel is up, or while we hold the
+          // menu open through a select→thinking drive (avoids slow reopen).
           if (typeof props.onOpenChange === "function") {
             const prev = props.onOpenChange;
             patches.push({ props, key: "onOpenChange", prev });
             props.onOpenChange = (open, ...rest) => {
-              if (open === false && state.panel && !state.busy) {
+              if (open === false && (state.panel || state.holdMenu)) {
                 return;
               }
               return prev(open, ...rest);
@@ -664,26 +972,33 @@
      * Activate a Radix menu item once. Do NOT walk parent fibers — that re-fires
      * ancestor onClick/onSelect (model row) and flips Thinking incorrectly.
      */
-  function activateMenuItem(item, opts = {}) {
+    function activateMenuItem(item, opts = {}) {
       if (!item) return false;
-  
+
+      // Default to a real pointer/click sequence — fiber prop walks often miss
+      // the app handler on current Perplexity builds, so the chip never updates.
+      if (opts.real !== false && !opts.preferClick) {
+        dispatchRealSelect(item);
+        return true;
+      }
+
       if (opts.real) {
         dispatchRealSelect(item);
         return true;
       }
-  
+
       const ev = (name) =>
         fakePointer(item, name === "onSelect" ? "click" : name.slice(2).toLowerCase(), {
           buttons: name === "onPointerDown" || name === "onMouseDown" ? 1 : 0,
         });
-  
-    // Rewrite model rows are submenu triggers: their Radix onSelect merely
-    // closes the menu, while their app-specific onClick performs the action.
-    if (opts.preferClick && callReactHandlers(item, ["onClick"], ev, 1)) return true;
 
-    // Prefer onSelect (Radix), then onClick — own props only.
+      // Rewrite model rows are submenu triggers: their Radix onSelect merely
+      // closes the menu, while their app-specific onClick performs the action.
+      if (opts.preferClick && callReactHandlers(item, ["onClick"], ev, 1)) return true;
+
+      // Prefer onSelect (Radix), then onClick — own props only.
       if (callReactHandlers(item, ["onSelect", "onClick"], ev, 1)) return true;
-  
+
       // Pointer sequence on own props only.
       if (
         callReactHandlers(item, ["onPointerDown"], ev, 1) ||
@@ -691,7 +1006,7 @@
       ) {
         return true;
       }
-  
+
       item.click();
       return true;
     }
@@ -711,13 +1026,14 @@
       if (!checkbox && !sw) return null;
       return { checkbox, sw, sub };
     }
-  
+
+    /** Fast Thinking toggle. Menu stays held open; chip is frozen by caller. */
     async function setThinking(item, wantOn, opts = {}) {
       forceOpenSubmenu(item);
       try {
         item.focus({ preventScroll: true });
       } catch {
-        item.focus();
+        /* ignore */
       }
       item.dispatchEvent(
         new KeyboardEvent("keydown", {
@@ -729,75 +1045,74 @@
           cancelable: true,
         })
       );
-  
-      let controls = null;
-      for (let i = 0; i < 30; i++) {
-        controls = thinkingControls(item);
-        if (controls) break;
-        if (i % 4 === 0) forceOpenSubmenu(item);
-        await wait(25);
+
+      let controls = thinkingControls(item);
+      if (!controls) {
+        controls = await waitFor(() => thinkingControls(item), { timeout: 280, interval: 6 });
       }
       if (!controls) {
-        return false;
+        forceOpenSubmenu(item);
+        controls = await waitFor(() => thinkingControls(item), { timeout: 180, interval: 8 });
       }
-  
+      if (!controls) return false;
+
       const el = controls.checkbox || controls.sw;
       const current = el.getAttribute("aria-checked") === "true";
       if (current === wantOn) return true;
-  
-      // One activation only — clicking both checkbox + switch toggles twice (no-op).
-      activateMenuItem(el, opts);
-      await wait(160);
-  
+
+      // Real click — fiber walks miss the handler on current builds.
+      activateMenuItem(el, { real: true });
+      const matched = await waitFor(() => {
+        const again = thinkingControls(item);
+        const el2 = again && (again.checkbox || again.sw);
+        if (!el2) return null;
+        return (el2.getAttribute("aria-checked") === "true") === wantOn ? true : null;
+      }, { timeout: 200, interval: 6 });
+      if (matched) return true;
+
       const again = thinkingControls(item);
-      const el2 = again && (again.checkbox || again.sw);
-      const after = el2 ? el2.getAttribute("aria-checked") === "true" : getSelection().thinking;
-      if (after === wantOn) return true;
-  
-      // Fallback: try the switch alone if we hit the checkbox first.
       if (again && again.sw && again.sw !== el) {
-        activateMenuItem(again.sw, opts);
-        await wait(140);
+        activateMenuItem(again.sw, { real: true });
+        const ok = await waitFor(() => {
+          const c = thinkingControls(item);
+          const el2 = c && (c.checkbox || c.sw);
+          if (!el2) return null;
+          return (el2.getAttribute("aria-checked") === "true") === wantOn ? true : null;
+        }, { timeout: 160, interval: 6 });
+        return !!ok;
       }
-      return getSelection().thinking === wantOn;
+      const final = thinkingControls(item);
+      const elFinal = final && (final.checkbox || final.sw);
+      return elFinal ? (elFinal.getAttribute("aria-checked") === "true") === wantOn : false;
     }
-  
+
     /** Open a fresh model menu (close first if needed so the click always opens). */
     async function openMenuFresh(triggerOverride) {
       const trigger = triggerOverride || getTrigger();
-      if (!trigger) {
-        return null;
-      }
-  
+      if (!trigger) return null;
+
       const wasBusy = state.busy;
       document.body.classList.add("pmu-expect");
       // Busy CSS sets pointer-events:none on menus — lift it while forcing open.
       document.body.classList.remove("pmu-busy");
-  
-      const waitUntil = async (pred, ticks = 40) => {
-        for (let i = 0; i < ticks; i++) {
-          if (pred()) return true;
-          await wait(25);
-        }
-        return pred();
-      };
-  
+      setDrive(true);
+
       try {
         // aria-expanded can stay "true" after a soft-dismiss even when no open menu
         // is found — a single click then closes instead of opening.
         if (trigger.getAttribute("aria-expanded") === "true" || getOpenModelMenu()) {
           trigger.click();
-          await waitUntil(
-            () => trigger.getAttribute("aria-expanded") !== "true" && !getOpenModelMenu(),
-            40
+          await waitFor(
+            () =>
+              trigger.getAttribute("aria-expanded") !== "true" && !getOpenModelMenu() ? true : null,
+            { timeout: 350, interval: 6 }
           );
         }
-  
+
         for (let attempt = 0; attempt < 2; attempt++) {
           trigger.click();
-          const ok = await waitUntil(() => !!getOpenModelMenu(), 60);
-          if (ok) {
-            const menu = getOpenModelMenu();
+          const menu = await waitFor(() => getOpenModelMenu(), { timeout: 500, interval: 6 });
+          if (menu) {
             hideMenu(menu);
             state.menu = menu;
             const linked = triggerFromMenu(menu);
@@ -807,213 +1122,253 @@
           }
           if (trigger.getAttribute("aria-expanded") === "true") {
             trigger.click();
-            await wait(100);
+            await waitFor(
+              () =>
+                trigger.getAttribute("aria-expanded") !== "true" && !getOpenModelMenu()
+                  ? true
+                  : null,
+              { timeout: 200, interval: 6 }
+            );
           }
         }
         return null;
       } finally {
         if (wasBusy) document.body.classList.add("pmu-busy");
-        if (!wasBusy) document.body.classList.remove("pmu-expect");
+        if (!wasBusy) {
+          document.body.classList.remove("pmu-expect");
+          if (!state.busy) setDrive(false);
+        }
       }
     }
-  
+
     /**
-     * Select against the real menu. Prefer activating while it is still open
-     * (early pointerdown pick). Fall back to reopen if Radix already dismissed.
+     * Select against the still-open native menu in ONE pass.
+     * Order for optional-thinking models:
+     *   1) freeze chip at final label (overlay — no double text)
+     *   2) hold menu open (no reopen)
+     *   3) set Thinking on the row's submenu FIRST
+     *   4) then activate the row to commit the model
+     * That avoids "lands on Thinking → flips to non-thinking" and the slow reopen.
      */
     async function selectModel(model, wantThinking) {
-      console.log("[PMU main] selectModel started", { name: model && model.name, wantThinking });
       if (Date.now() < state.ignoreSelectUntil) {
-        console.log("[PMU main] selection ignored by cooldown");
         state.picking = false;
         return;
       }
       const modelName = model.name;
       const needsToggle = model.canToggleThinking;
+      const finalThinking = needsToggle ? !!wantThinking : !!model.forcedThinking;
       let item = model.el && document.contains(model.el) ? model.el : null;
       let menu = getOpenModelMenu();
-      if (!menu && state.menu && document.contains(state.menu) && state.menu.getAttribute("data-state") === "open") {
+      if (
+        !menu &&
+        state.menu &&
+        document.contains(state.menu) &&
+        state.menu.getAttribute("data-state") === "open"
+      ) {
         menu = state.menu;
       }
-  
-  
+
+      const before = readTriggerSelection();
+
       destroyPanel();
       setExpect(false);
       markPicking();
       setBusy(true);
-  
+      setDrive(true);
+      // Overlay freezes the chip at the FINAL label for the whole drive.
+      freezeChip(modelName, finalThinking);
+      saveLastSelection(modelName, finalThinking);
+
       try {
+        if (before.name === modelName && before.thinking === finalThinking) {
+          return;
+        }
+
         if (!menu || !document.contains(menu) || menu.getAttribute("data-state") !== "open") {
           unlockMenuOpen();
           menu = await openMenuFresh();
           item = null;
         }
-        if (!menu) {
-          return;
-        }
-  
+        if (!menu) return;
+
         hideMenu(menu);
+        lockMenuOpen(menu);
+
         if (!item || !document.contains(item)) item = findModelItem(menu, modelName);
-        if (!item) {
+        if (!item) return;
+
+        // Same model, only Thinking differs — toggle only, no row re-select.
+        if (needsToggle && before.name === modelName) {
+          state.holdMenu = true;
+          await setThinking(item, finalThinking);
           return;
         }
-  
-        activateMenuItem(item);
-        await wait(180);
-        let sel = getSelection();
-  
-        if (!needsToggle) return;
-  
-        if (sel.name === modelName && sel.thinking === wantThinking) {
-          return;
-        }
-  
-        // Prefer toggling on the still-open menu before a full reopen.
-        if (document.contains(item) && getOpenModelMenu()) {
-          await setThinking(item, wantThinking);
-          await wait(100);
-          sel = getSelection();
-          if (sel.name === modelName && sel.thinking === wantThinking) {
-            return;
+
+        if (needsToggle) {
+          // Thinking FIRST while menu is held — chip already shows final label.
+          state.holdMenu = true;
+          await setThinking(item, finalThinking);
+          if (!document.contains(item)) {
+            item =
+              findModelItem(menu, modelName) ||
+              findModelItem(getOpenModelMenu() || menu, modelName);
+            if (!item) return;
           }
         }
-  
+
+        // Commit the model row. Release hold so Radix can close + apply selection.
+        state.holdMenu = false;
         unlockMenuOpen();
-        menu = await openMenuFresh();
-        if (!menu) return;
-        item = findModelItem(menu, modelName);
-        if (!item) return;
-  
-        await setThinking(item, wantThinking);
-        await wait(120);
+        hideMenu(menu);
+        activateMenuItem(item, { real: true });
+        await wait(50);
+
+        if (!needsToggle) return;
+
+        // Chip is frozen — don't trust its text. Verify via submenu controls.
+        // Non-thinking is the usual failure mode (row-select often defaults ON).
+        let liveMenu = getOpenModelMenu();
+        if (liveMenu && document.contains(liveMenu)) {
+          hideMenu(liveMenu);
+          item = findModelItem(liveMenu, modelName);
+          if (item) {
+            forceOpenSubmenu(item);
+            const c = await waitFor(() => thinkingControls(item), { timeout: 100, interval: 5 });
+            if (c) {
+              const el = c.checkbox || c.sw;
+              if (el && (el.getAttribute("aria-checked") === "true") !== finalThinking) {
+                state.holdMenu = true;
+                lockMenuOpen(liveMenu);
+                await setThinking(item, finalThinking);
+              }
+            } else if (!finalThinking) {
+              state.holdMenu = true;
+              lockMenuOpen(liveMenu);
+              await setThinking(item, false);
+            }
+          }
+        } else if (!finalThinking) {
+          // Menu closed after select; force non-thinking under frozen chip.
+          liveMenu = await openMenuFresh();
+          if (!liveMenu) return;
+          item = findModelItem(liveMenu, modelName);
+          if (!item) return;
+          state.holdMenu = true;
+          lockMenuOpen(liveMenu);
+          hideMenu(liveMenu);
+          await setThinking(item, false);
+        }
       } finally {
+        state.holdMenu = false;
+        saveLastSelection(modelName, finalThinking);
         unlockMenuOpen();
-        // Keep suppress past the 500ms sync interval so a leftover open menu
-        // can't immediately bring the panel back.
-        state.suppressPanelUntil = Date.now() + 1500;
+        state.suppressPanelUntil = Date.now() + 700;
         forceCloseMenu();
-        await wait(40);
+        await waitFor(() => (!getOpenModelMenu() ? true : null), { timeout: 120, interval: 6 });
         if (getOpenModelMenu()) forceCloseMenu();
         state.menu = null;
         state.picking = false;
+        setDrive(false);
         setBusy(false);
         setExpect(false);
+        // Overlay stays until native crossfade settles (async).
+        unfreezeChip();
       }
     }
-  
+
     /**
      * Same shape as selectModel(), but scoped to a Rewrite menu's own trigger —
      * never touches the main composer trigger. There's no persistent "current
      * selection" label to verify against (unlike the composer button), so this
      * skips the getSelection()-based shortcuts and just drives the real item.
      */
-  async function selectRewriteModel(model, wantThinking) {
-      console.log("[PMU rewrite] selection started", {
-        name: model && model.name,
-        wantThinking,
-        hasRewriteTrigger: !!state.rewriteTrigger,
-        hasCachedMenu: !!state.menu,
-      });
+    async function selectRewriteModel(model, wantThinking) {
       if (Date.now() < state.ignoreSelectUntil) {
-        console.log("[PMU rewrite] selection ignored by cooldown");
         state.picking = false;
         return;
       }
-  
+
       const modelName = model.name;
       const needsToggle = model.canToggleThinking;
-    const rwTrigger = state.rewriteTrigger;
+      const finalThinking = needsToggle ? !!wantThinking : !!model.forcedThinking;
+      const rwTrigger = state.rewriteTrigger;
       let item = model.el && document.contains(model.el) ? model.el : null;
       let menu = getOpenModelMenu();
-      if (!menu && state.menu && document.contains(state.menu) && state.menu.getAttribute("data-state") === "open") {
+      if (
+        !menu &&
+        state.menu &&
+        document.contains(state.menu) &&
+        state.menu.getAttribute("data-state") === "open"
+      ) {
         menu = state.menu;
       }
-  
+
       destroyPanel();
       setExpect(false);
       markPicking();
-    setBusy(true);
+      setBusy(true);
 
-    const confirmRewrite = async () => {
-      const root = menu && document.contains(menu) ? menu : document;
-      const confirm = [...root.querySelectorAll("button")].find((button) => (button.textContent || "").trim() === "Rewrite");
-      if (!confirm) {
-        console.log("[PMU rewrite] native Rewrite button not found");
-        return false;
-      }
-      const activated = activateMenuItem(confirm, { preferClick: true });
-      console.log("[PMU rewrite] native Rewrite button ->", activated);
-      await wait(120);
-      return activated;
-    };
-  
+      const confirmRewrite = async () => {
+        const root = menu && document.contains(menu) ? menu : document;
+        const confirm = [...root.querySelectorAll("button")].find(
+          (button) => (button.textContent || "").trim() === "Rewrite"
+        );
+        if (!confirm) return false;
+        const activated = activateMenuItem(confirm, { preferClick: true });
+        await wait(40);
+        return activated;
+      };
+
       try {
         if (!menu || !document.contains(menu) || menu.getAttribute("data-state") !== "open") {
           unlockMenuOpen();
           menu = await openMenuFresh(rwTrigger);
           item = null;
         }
-        if (!menu) {
-          console.log("[PMU rewrite] no open menu available");
-          return;
-        }
-  
+        if (!menu) return;
+
         hideMenu(menu);
         if (!item || !document.contains(item)) item = findModelItem(menu, modelName);
-        if (!item) {
-          console.log("[PMU rewrite] no matching item found for", modelName, "in menu", menu);
-          return;
-        }
-  
-      const activated = activateMenuItem(item);
-      console.log("[PMU rewrite] activateMenuItem", modelName, "->", activated, item);
-      await wait(180);
+        if (!item) return;
 
-      const submenuId = item.getAttribute("aria-controls");
-      const submenu = submenuId && document.getElementById(submenuId);
-      if (submenu) {
-        console.log(
-          "[PMU rewrite] submenu rows",
-          JSON.stringify(
-            [...submenu.querySelectorAll('[role^="menuitem"]')].map((el) => ({
-              role: el.getAttribute("role"),
-              checked: el.getAttribute("aria-checked"),
-              text: (el.textContent || "").trim(),
-            }))
-          )
-        );
-      }
+        activateMenuItem(item);
 
-      if (!needsToggle) {
-        await confirmRewrite();
-        return;
-      }
-  
-        if (document.contains(item) && getOpenModelMenu()) {
-          await setThinking(item, wantThinking);
-          await wait(100);
+        if (!needsToggle) {
+          await wait(60);
           await confirmRewrite();
           return;
         }
-  
+
+        // Brief settle so submenu/state can attach, then set Thinking.
+        await wait(50);
+        if (document.contains(item) && getOpenModelMenu()) {
+          await setThinking(item, finalThinking);
+          await wait(40);
+          await confirmRewrite();
+          return;
+        }
+
         unlockMenuOpen();
         menu = await openMenuFresh(rwTrigger);
         if (!menu) return;
         item = findModelItem(menu, modelName);
         if (!item) return;
-  
-        await setThinking(item, wantThinking);
-        await wait(120);
+
+        activateMenuItem(item);
+        await wait(50);
+        await setThinking(item, finalThinking);
+        await wait(40);
         await confirmRewrite();
       } finally {
         unlockMenuOpen();
-        state.suppressPanelUntil = Date.now() + 1500;
+        state.suppressPanelUntil = Date.now() + 900;
         // Rewrite selection appears to pass through the same Radix close path
         // as a normal menu selection. Give Perplexity's deferred rewrite work
         // time to consume that selection before we force its menu closed.
-        await wait(900);
+        await wait(500);
         forceCloseMenu(rwTrigger);
-        await wait(40);
+        await waitFor(() => (!getOpenModelMenu() ? true : null), { timeout: 200, interval: 8 });
         if (getOpenModelMenu()) forceCloseMenu(rwTrigger);
         state.menu = null;
         state.rewriteTrigger = null;
@@ -1164,9 +1519,8 @@
       const items = [...menu.querySelectorAll('[role^="menuitem"]')];
       const best = items.find(
         (it) =>
-          it.getAttribute("role") === "menuitemradio" &&
           !it.getAttribute("aria-haspopup") &&
-          /Selects the best/.test(it.textContent || "")
+          isAutoBestItem(it)
       );
       const models = items
         .filter(
@@ -1191,6 +1545,7 @@
       destroyPanel();
       hideMenu(menu);
       state.menu = menu;
+      state.panelMode = "model";
       state.lastModels = unlocked;
       state.lastAllModels = models;
       state.editMode = false;
@@ -1357,8 +1712,8 @@
       const items = [...menu.querySelectorAll('[role^="menuitem"]')];
       const models = items
         .filter((it) => it.getAttribute("role") !== "menuitemcheckbox")
-        // Drop auto "Best" entry and standalone "Search" option
-        .filter((it) => !/Selects the best available model/i.test(it.textContent || ""))
+        // Drop auto "Best"/promo entry and standalone "Search" option
+        .filter((it) => !isAutoBestItem(it))
         .map(extractItem)
         .filter((m) => !/^search$/i.test((m.name || "").trim()));
   
@@ -1452,7 +1807,7 @@
       }
 
       for (const item of menu.querySelectorAll('[role^="menuitem"]')) {
-        const isAutoBest = /Selects the best available model/i.test(item.textContent || "");
+        const isAutoBest = isAutoBestItem(item);
         item.classList.toggle("pmu-rewrite-native-best", isAutoBest);
         // Keep model choices together, ahead of Search/Research/Learn actions.
         item.style.order = item.querySelector('.col-start-2 span[translate="no"]') ? "1" : "2";
@@ -1579,18 +1934,11 @@
         }
   
         const cell = e.target.closest("button.pmu-cell");
-        console.log("[PMU debug] panel pointerdown cell", {
-          cellFound: !!cell,
-          target: e.target,
-          panelMode: state.panelMode,
-          lastModelsCount: (state.lastModels || []).length
-        });
         if (!cell) return;
 
         const name = cell.getAttribute("data-name");
         const wantThinking = cell.getAttribute("data-mode") === "thinking";
         const model = (state.lastModels || []).find((m) => m.name === name);
-        console.log("[PMU debug] cell clicked", { name, wantThinking, modelFound: !!model });
         if (!model) return;
 
         state.pickHandled = true;
@@ -1609,7 +1957,6 @@
         if (!btn) return;
         const isRw = isRewriteButton(btn);
         const isMain = isLikelyModelTrigger(btn);
-        console.log("[PMU debug] trigger pointerdown", { isRw, isMain, btn });
         if (isRw) {
           // Its menu shares our model-menu markup — route it to showRewritePanel
           // (via sync()) instead of the main composer flow.
@@ -1644,8 +1991,14 @@
       true
     );
   
+    let syncRaf = 0;
     const mo = new MutationObserver(() => {
-      sync();
+      // Coalesce high-frequency Radix mutations into one sync per frame.
+      if (syncRaf) return;
+      syncRaf = requestAnimationFrame(() => {
+        syncRaf = 0;
+        sync();
+      });
     });
     mo.observe(document.documentElement, {
       childList: true,
@@ -1797,8 +2150,14 @@
   
     // Cheap periodic backup in case a mutation is missed.
     setInterval(() => {
-      if (!state.busy) sync();
+      if (!state.busy) {
+        sync();
+        if (!state.chipFreeze) repairDoubledChipLabel();
+      }
     }, 500);
-  
-    setTimeout(() => checkModelsConfigOnce(), 4000);
+
+    setTimeout(() => {
+      repairDoubledChipLabel();
+      checkModelsConfigOnce();
+    }, 1500);
   })();
